@@ -434,6 +434,12 @@ export type Database = {
           email: string
         }[]
       }
+      adoption_count_for_tree: {
+        Args: {
+          t_id: string
+        }
+        Returns: number
+      }
       get_watered_and_adopted: {
         Args: Record<PropertyKey, never>
         Returns: {
