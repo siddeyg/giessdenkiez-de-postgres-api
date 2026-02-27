@@ -1,14 +1,6 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { corsHeaders } from "../_shared/cors.ts";
 import { loadEnvVars } from "../_shared/check-env.ts";
-import {
-	GdkStats,
-	Monthly,
-	MonthlyWeather,
-	TreeAdoptions,
-	TreeSpecies,
-	Watering,
-} from "../_shared/common.ts";
 import { GdkError, ErrorTypes } from "../_shared/errors.ts";
 
 const ENV_VARS = ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "PUMPS_URL"];
@@ -20,89 +12,10 @@ const supabaseServiceRoleClient = createClient(
 	SUPABASE_SERVICE_ROLE_KEY
 );
 
-const getMostFrequentTreeSpecies = async (): Promise<TreeSpecies[]> => {
-	const { data, error } = await supabaseServiceRoleClient
-		.from("most_frequent_tree_species")
-		.select("*");
-
-	// rename all fields from gattung_deutsch to speciesName
-	const renamedData = data.map((species) => ({
-		speciesName: species.gattung_deutsch,
-		percentage: species.percentage,
-	}));
-
-	if (error) {
-		throw new GdkError(
-			error.message,
-			ErrorTypes.GdkStatsMostFrequentTreeSpecies
-		);
-	}
-
-	return renamedData;
-};
-
-const getTotalTreeSpeciesCount = async (): Promise<number> => {
-	const { data, error } = await supabaseServiceRoleClient
-		.from("total_tree_species_count")
-		.select("*");
-
-	if (error) {
-		throw new GdkError(error.message, ErrorTypes.GdkStatsTreeSpeciesCount);
-	}
-
-	return data[0].count ?? 0;
-};
-
-const getTreeCount = async (): Promise<number> => {
-	const { data, error } = await supabaseServiceRoleClient
-		.from("trees_count")
-		.select("count");
-
-	if (error) {
-		throw new GdkError(error.message, ErrorTypes.GdkStatsTreeCount);
-	}
-
-	if (data === null) {
-		throw new GdkError(
-			"Could not fetch count of trees_count table",
-			ErrorTypes.GdkStatsTreeCount
-		);
-	}
-
-	return data[0].count ?? 0;
-};
-
-const getUserProfilesCount = async (): Promise<number> => {
-	const { count } = await supabaseServiceRoleClient
-		.from("profiles")
-		.select("*", { count: "exact", head: true });
-
-	if (count === null) {
-		throw new GdkError(
-			"Could not fetch count of profiles table",
-			ErrorTypes.GdkStatsUser
-		);
-	}
-
-	return count || 0;
-};
-
-const getWateringsCount = async (): Promise<number> => {
-	const beginningOfYear = new Date(`${new Date().getFullYear()}-01-01`);
-	const { count } = await supabaseServiceRoleClient
-		.from("trees_watered")
-		.select("*", { count: "exact", head: true })
-		.gt("timestamp", beginningOfYear.toISOString());
-
-	if (count === null) {
-		throw new GdkError(
-			"Could not fetch count of trees_watered table",
-			ErrorTypes.GdkStatsWatering
-		);
-	}
-
-	return count || 0;
-};
+// Cache is considered fresh for 24 hours. The first request after expiry
+// triggers a synchronous recompute (refresh_gdk_stats_cache RPC), which then
+// serves all subsequent requests for the next 24 hours instantly.
+const CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 const getPumpsCount = async (): Promise<number> => {
 	const response = await fetch(PUMPS_URL);
@@ -113,73 +26,43 @@ const getPumpsCount = async (): Promise<number> => {
 	return geojson.features.length;
 };
 
-const getAdoptedTreesCount = async (): Promise<TreeAdoptions> => {
+const getCachedPayload = async (): Promise<Record<string, unknown> | null> => {
 	const { data, error } = await supabaseServiceRoleClient
-		.rpc("calculate_adoptions")
-		.select("*");
+		.from("gdk_stats_cache")
+		.select("payload, computed_at")
+		.maybeSingle();
 
-	if (error) {
-		throw new GdkError(error.message, ErrorTypes.GdkStatsAdoption);
-	}
+	if (error || !data) return null;
 
-	return {
-		count: data[0].total_adoptions,
-		veryThirstyCount: data[0].very_thirsty_adoptions,
-	} as TreeAdoptions;
+	const ageMs = Date.now() - new Date(data.computed_at).getTime();
+	if (ageMs > CACHE_MAX_AGE_MS) return null; // stale — trigger recompute
+
+	return data.payload as Record<string, unknown>;
 };
 
-const getMonthlyWaterings = async (): Promise<Monthly[]> => {
-	const { data, error } = await supabaseServiceRoleClient
-		.rpc("calculate_avg_waterings_per_month")
-		.select("*");
+const refreshCache = async (): Promise<Record<string, unknown>> => {
+	// Recompute all DB-derived stats in a single SQL function call and store
+	// the result in gdk_stats_cache. Then read back the freshly written row.
+	const { error: rpcError } = await supabaseServiceRoleClient
+		.rpc("refresh_gdk_stats_cache");
 
-	if (error) {
-		throw new GdkError(error.message, ErrorTypes.GdkStatsWatering);
+	if (rpcError) {
+		throw new GdkError(rpcError.message, ErrorTypes.GdkStatsWatering);
 	}
 
-	return data.map((month: any) => ({
-		month: month.month,
-		wateringCount: month.watering_count,
-		totalSum: month.total_sum,
-		averageAmountPerWatering: month.avg_amount_per_watering,
-	}));
-};
-
-const getMonthlyWeather = async (): Promise<MonthlyWeather[]> => {
 	const { data, error } = await supabaseServiceRoleClient
-		.rpc("get_monthly_weather")
-		.select("*");
+		.from("gdk_stats_cache")
+		.select("payload")
+		.single();
 
-	if (error) {
-		throw new GdkError(error.message, ErrorTypes.GdkStatsWeather);
+	if (error || !data) {
+		throw new GdkError(
+			"Cache refresh succeeded but reading result failed",
+			ErrorTypes.GdkStatsWatering
+		);
 	}
 
-	return data.map((month: any) => ({
-		month: month.month,
-		averageTemperatureCelsius: month.avg_temperature_celsius,
-		maximumTemperatureCelsius: month.max_temperature_celsius,
-		totalRainfallLiters: month.total_rainfall_liters,
-	}));
-};
-
-const getWaterings = async (): Promise<Watering[]> => {
-	const { data, error } = await supabaseServiceRoleClient
-		.rpc("get_waterings_with_location")
-		.select("*");
-
-	if (error) {
-		throw new GdkError(error.message, ErrorTypes.GdkStatsWatering);
-	}
-
-	return data.map((watering: any) => {
-		return {
-			id: watering.id,
-			lat: watering.lat,
-			lng: watering.lng,
-			amount: watering.amount,
-			timestamp: watering.timestamp,
-		};
-	});
+	return data.payload as Record<string, unknown>;
 };
 
 const handler = async (request: Request): Promise<Response> => {
@@ -188,42 +71,16 @@ const handler = async (request: Request): Promise<Response> => {
 	}
 
 	try {
-		const [
-			usersCount,
-			wateringsCount,
-			treeAdoptions,
-			numPumps,
-			monthlyWaterings,
-			waterings,
-			monthlyWeather,
-			treeCount,
-			totalTreeSpeciesCount,
-			mostFrequentTreeSpecies,
-		] = await Promise.all([
-			getUserProfilesCount(),
-			getWateringsCount(),
-			getAdoptedTreesCount(),
+		// Fetch cache and pumps count in parallel.
+		// pumps come from an external URL (Supabase Storage) and cannot be
+		// cached in SQL, so they are always fetched live and merged in.
+		const [cachedPayload, numPumps] = await Promise.all([
+			getCachedPayload(),
 			getPumpsCount(),
-			getMonthlyWaterings(),
-			getWaterings(),
-			getMonthlyWeather(),
-			getTreeCount(),
-			getTotalTreeSpeciesCount(),
-			getMostFrequentTreeSpecies(),
 		]);
 
-		const stats: GdkStats = {
-			numTrees: treeCount,
-			numPumps: numPumps,
-			numActiveUsers: usersCount,
-			numWateringsThisYear: wateringsCount,
-			monthlyWaterings: monthlyWaterings,
-			treeAdoptions: treeAdoptions,
-			mostFrequentTreeSpecies: mostFrequentTreeSpecies,
-			totalTreeSpeciesCount: totalTreeSpeciesCount,
-			waterings: waterings,
-			monthlyWeather: monthlyWeather,
-		};
+		const dbPayload = cachedPayload ?? await refreshCache();
+		const stats = { ...dbPayload, numPumps };
 
 		return new Response(JSON.stringify(stats), {
 			status: 200,
