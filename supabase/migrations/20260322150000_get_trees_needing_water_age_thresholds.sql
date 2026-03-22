@@ -1,7 +1,9 @@
--- Function: get_trees_needing_water
--- Returns trees near a given location that are likely to need watering,
--- ranked by urgency (low rainfall + young age + proximity).
--- Called via: supabaseClient.rpc("get_trees_needing_water", { lat, lng, radius_m, max_results })
+-- Update get_trees_needing_water: use age-based drought thresholds
+-- matching the existing GDK water-needs model (use-tree-water-needs-data.tsx):
+--   Baby  (≤ 5y):  < 100  (10mm)
+--   Junior (6-10y): < 200 (20mm)
+--   Senior (> 10y): < 300 (30mm)
+--   Unknown:        < 200 (20mm)
 
 CREATE OR REPLACE FUNCTION get_trees_needing_water(
   p_lat        float,
